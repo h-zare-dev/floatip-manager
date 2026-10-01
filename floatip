@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FILE="/etc/netplan/60-floating-ip.yaml"
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  floatip show
+  floatip add IP [IP ...]
+  floatip del IP [IP ...]
+  floatip set IP [IP ...]
+  floatip clear
+
+Aliases:
+  floatip delete IP [IP ...]
+  floatip remove IP [IP ...]
+
+Optional interface override:
+  FLOATIP_IFACE=ens3 floatip ...
+USAGE
+    exit 1
+}
+
+require_root() {
+    [ "${EUID}" -eq 0 ] || die "Run this command with sudo/root."
+}
+
+require_dependencies() {
+    command -v ip >/dev/null 2>&1 \
+        || die "The 'ip' command is not available."
+
+    command -v netplan >/dev/null 2>&1 \
+        || die "Netplan is not installed. No changes were made."
+}
+
+detect_interface() {
+    local iface=""
+
+    if [ -n "${FLOATIP_IFACE:-}" ]; then
+        iface="$FLOATIP_IFACE"
+
+        [ -e "/sys/class/net/$iface" ] \
+            || die "Interface '$iface' does not exist."
+
+        echo "$iface"
+        return
+    fi
+
+    iface="$(
+        ip -4 route show default 2>/dev/null |
+        awk '/^default/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "dev") {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }'
+    )"
+
+    if [ -z "$iface" ]; then
+        iface="$(
+            ip -4 route get 1.1.1.1 2>/dev/null |
+            awk '{
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "dev") {
+                        print $(i + 1)
+                        exit
+                    }
+                }
+            }'
+        )"
+    fi
+
+    [ -n "$iface" ] || die "Could not detect the primary IPv4 interface."
+    [ -e "/sys/class/net/$iface" ] \
+        || die "Detected interface '$iface' does not exist."
+
+    echo "$iface"
+}
+
+get_primary_ipv4() {
+    ip -4 route get 1.1.1.1 2>/dev/null |
+    awk '{
+        for (i = 1; i <= NF; i++) {
+            if ($i == "src") {
+                print $(i + 1)
+                exit
+            }
+        }
+    }'
+}
+
+validate_ipv4() {
+    local address="$1"
+    local a b c d octet
+
+    [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+
+    IFS=. read -r a b c d <<< "$address"
+
+    for octet in "$a" "$b" "$c" "$d"; do
+        (( 10#$octet >= 0 && 10#$octet <= 255 )) || return 1
+    done
+}
+
+ensure_not_primary() {
+    local address="$1"
+    local primary=""
+
+    primary="$(get_primary_ipv4 || true)"
+
+    if [ -n "$primary" ] && [ "$address" = "$primary" ]; then
+        die "$address is the current primary/default-route source IPv4 address and will not be managed as a floating IP."
+    fi
+}
+
+get_configured_ips() {
+    [ -f "$FILE" ] || return 0
+
+    grep -E \
+        '^[[:space:]]*-[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/32[[:space:]]*$' \
+        "$FILE" 2>/dev/null |
+    sed -E \
+        's/^[[:space:]]*-[[:space:]]*//; s#/32[[:space:]]*$##' || true
+}
+
+contains_ip() {
+    local wanted="$1"
+    shift
+
+    local item
+    for item in "$@"; do
+        [ "$item" = "$wanted" ] && return 0
+    done
+
+    return 1
+}
+
+is_active() {
+    local address="$1"
+
+    ip -4 -o addr show dev "$IFACE" |
+        awk '{print $4}' |
+        grep -Fxq "${address}/32"
+}
+
+write_config() {
+    local ips=("$@")
+
+    if [ "${#ips[@]}" -eq 0 ]; then
+        rm -f "$FILE"
+        return
+    fi
+
+    {
+        echo "network:"
+        echo "  version: 2"
+        echo "  ethernets:"
+        echo "    ${IFACE}:"
+        echo "      addresses:"
+
+        local address
+        for address in "${ips[@]}"; do
+            echo "        - ${address}/32"
+        done
+    } > "$FILE"
+
+    chmod 600 "$FILE"
+}
+
+restore_config() {
+    local backup="$1"
+    local existed="$2"
+
+    if [ "$existed" = "yes" ]; then
+        cp -a "$backup" "$FILE"
+    else
+        rm -f "$FILE"
+    fi
+
+    netplan generate >/dev/null 2>&1 || true
+
+    if command -v networkctl >/dev/null 2>&1; then
+        networkctl reload >/dev/null 2>&1 || true
+    fi
+}
+
+apply_desired() {
+    local desired=("$@")
+    local old=()
+    local backup=""
+    local existed="no"
+    local address
+
+    mapfile -t old < <(get_configured_ips)
+
+    if [ -f "$FILE" ]; then
+        backup="$(mktemp)"
+        cp -a "$FILE" "$backup"
+        existed="yes"
+    fi
+
+    write_config "${desired[@]}"
+
+    if ! netplan generate; then
+        echo "Netplan validation failed. Restoring previous configuration." >&2
+        restore_config "$backup" "$existed"
+        [ -z "$backup" ] || rm -f "$backup"
+        exit 1
+    fi
+
+    # Reload generated networkd configuration without reconfiguring the
+    # primary interface. Runtime changes below touch only managed /32 IPs.
+    if command -v networkctl >/dev/null 2>&1; then
+        networkctl reload >/dev/null 2>&1 || true
+    fi
+
+    local added=()
+    local removed=()
+
+    # Add new/missing addresses first.
+    for address in "${desired[@]}"; do
+        if ! is_active "$address"; then
+            if ip addr add "${address}/32" dev "$IFACE"; then
+                added+=("$address")
+            else
+                echo "Failed to add ${address}. Rolling back." >&2
+
+                local added_ip
+                for added_ip in "${added[@]}"; do
+                    ip addr del "${added_ip}/32" dev "$IFACE" 2>/dev/null || true
+                done
+
+                restore_config "$backup" "$existed"
+                [ -z "$backup" ] || rm -f "$backup"
+                exit 1
+            fi
+        fi
+    done
+
+    # Remove only addresses that were previously managed by this tool and
+    # are no longer part of the desired list.
+    for address in "${old[@]}"; do
+        if ! contains_ip "$address" "${desired[@]}"; then
+            if is_active "$address"; then
+                if ip addr del "${address}/32" dev "$IFACE"; then
+                    removed+=("$address")
+                else
+                    echo "Failed to remove ${address}. Rolling back." >&2
+
+                    local removed_ip added_ip
+
+                    for removed_ip in "${removed[@]}"; do
+                        ip addr add "${removed_ip}/32" dev "$IFACE" 2>/dev/null || true
+                    done
+
+                    for added_ip in "${added[@]}"; do
+                        ip addr del "${added_ip}/32" dev "$IFACE" 2>/dev/null || true
+                    done
+
+                    restore_config "$backup" "$existed"
+                    [ -z "$backup" ] || rm -f "$backup"
+                    exit 1
+                fi
+            fi
+        fi
+    done
+
+    [ -z "$backup" ] || rm -f "$backup"
+}
+
+require_root
+require_dependencies
+IFACE="$(detect_interface)"
+
+case "${1:-}" in
+    show)
+        echo "Interface: $IFACE"
+        echo "Floating IPs:"
+
+        mapfile -t ips < <(get_configured_ips)
+
+        if [ "${#ips[@]}" -eq 0 ]; then
+            echo "  none"
+            exit 0
+        fi
+
+        for address in "${ips[@]}"; do
+            if is_active "$address"; then
+                printf "  %-15s active\n" "$address"
+            else
+                printf "  %-15s MISSING\n" "$address"
+            fi
+        done
+        ;;
+
+    add)
+        shift
+        [ "$#" -gt 0 ] || usage
+
+        mapfile -t current < <(get_configured_ips)
+        desired=("${current[@]}")
+
+        for address in "$@"; do
+            validate_ipv4 "$address" || die "Invalid IPv4 address: $address"
+            ensure_not_primary "$address"
+
+            if ! contains_ip "$address" "${desired[@]}"; then
+                desired+=("$address")
+            fi
+        done
+
+        apply_desired "${desired[@]}"
+        echo "Floating IPs updated."
+        ;;
+
+    del|delete|remove)
+        shift
+        [ "$#" -gt 0 ] || usage
+
+        mapfile -t current < <(get_configured_ips)
+
+        for address in "$@"; do
+            validate_ipv4 "$address" || die "Invalid IPv4 address: $address"
+
+            contains_ip "$address" "${current[@]}" \
+                || die "$address is not managed by floatip."
+        done
+
+        desired=()
+
+        for existing in "${current[@]}"; do
+            remove_it="no"
+
+            for requested in "$@"; do
+                if [ "$existing" = "$requested" ]; then
+                    remove_it="yes"
+                    break
+                fi
+            done
+
+            [ "$remove_it" = "yes" ] || desired+=("$existing")
+        done
+
+        apply_desired "${desired[@]}"
+        echo "Floating IPs updated."
+        ;;
+
+    set)
+        shift
+        [ "$#" -gt 0 ] || usage
+
+        desired=()
+
+        for address in "$@"; do
+            validate_ipv4 "$address" || die "Invalid IPv4 address: $address"
+            ensure_not_primary "$address"
+
+            if ! contains_ip "$address" "${desired[@]}"; then
+                desired+=("$address")
+            fi
+        done
+
+        apply_desired "${desired[@]}"
+        echo "Floating IP list updated."
+        ;;
+
+    clear)
+        apply_desired
+        echo "All managed floating IPs removed."
+        ;;
+
+    *)
+        usage
+        ;;
+esac
