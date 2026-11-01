@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RAW_BASE="https://raw.githubusercontent.com/h-zare-dev/floatip-manager/main"
+REF="${FLOATIP_REF:-main}"
+[[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [[ "$REF" != *..* ]] || { echo "Invalid FLOATIP_REF" >&2; exit 1; }
+RAW_BASE="https://raw.githubusercontent.com/h-zare-dev/floatip-manager/${REF}"
 TARGET="/usr/local/sbin/floatip"
 
 fail() {
@@ -44,6 +46,7 @@ install -m 0755 "$TMP_FILE" "$TARGET"
 echo
 echo "floatip-manager installed successfully."
 echo "Command: $TARGET"
+echo "Source ref: $REF"
 echo
 echo "Examples:"
 echo "  sudo floatip add 203.0.113.10"
