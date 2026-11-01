@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+VERSION="1.0.1"
 FILE="/etc/netplan/60-floating-ip.yaml"
+
+if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
+    printf '%s\n' "$VERSION"
+    exit 0
+fi
 
 die() {
     echo "ERROR: $*" >&2
@@ -16,6 +22,7 @@ Usage:
   floatip del IP [IP ...]
   floatip set IP [IP ...]
   floatip clear
+  floatip --version
 
 Aliases:
   floatip delete IP [IP ...]
