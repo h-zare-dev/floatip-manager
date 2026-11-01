@@ -1,0 +1,47 @@
+name: Publish versioned release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - VERSION
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v$(tr -d '\r\n' < VERSION)"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test -f "releases/$TAG.md"
+          grep -Fxq "VERSION=\"${TAG#v}\"" floatip
+          bash -n floatip install.sh
+          if git show-ref --verify --quiet "refs/tags/$TAG"; then
+            echo "Tag $TAG already exists" >&2
+            exit 1
+          fi
+
+      - name: Create tag and publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="v$(tr -d '\r\n' < VERSION)"
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "floatip-manager $TAG (Stable)" \
+            --notes-file "releases/$TAG.md" \
+            --latest
