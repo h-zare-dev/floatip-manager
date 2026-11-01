@@ -147,8 +147,21 @@ is_active() {
     local address="$1"
 
     ip -4 -o addr show dev "$IFACE" |
-        awk '{print $4}' |
-        grep -Fxq "${address}/32"
+        awk '{split($4, a, "/"); print a[1]}' |
+        grep -Fxq "$address"
+}
+
+active_prefix() {
+    local address="$1"
+
+    ip -4 -o addr show dev "$IFACE" |
+        awk -v wanted="$address" '{
+            split($4, a, "/")
+            if (a[1] == wanted) {
+                print a[2]
+                exit
+            }
+        }'
 }
 
 write_config() {
@@ -185,11 +198,10 @@ restore_config() {
         rm -f "$FILE"
     fi
 
+    # Regenerate backend files only. Do not reload/reconfigure networkd here:
+    # runtime addresses are managed explicitly below, and a networkd reload can
+    # race with ip addr add/del by applying the same address concurrently.
     netplan generate >/dev/null 2>&1 || true
-
-    if command -v networkctl >/dev/null 2>&1; then
-        networkctl reload >/dev/null 2>&1 || true
-    fi
 }
 
 apply_desired() {
@@ -197,7 +209,7 @@ apply_desired() {
     local old=()
     local backup=""
     local existed="no"
-    local address
+    local address prefix
 
     mapfile -t old < <(get_configured_ips)
 
@@ -216,18 +228,29 @@ apply_desired() {
         exit 1
     fi
 
-    # Reload generated networkd configuration without reconfiguring the
-    # primary interface. Runtime changes below touch only managed /32 IPs.
-    if command -v networkctl >/dev/null 2>&1; then
-        networkctl reload >/dev/null 2>&1 || true
-    fi
+    # Do not call networkctl reload here. On systemd-networkd, reload of a
+    # changed .network file may immediately reconfigure the interface. That can
+    # race with the explicit ip addr operations below and produce
+    # "Address already assigned". netplan generate is enough for persistence;
+    # runtime changes are applied explicitly, and networkd will consume the
+    # generated config on its next restart/reconfigure or at boot.
 
     local added=()
     local removed=()
 
-    # Add new/missing addresses first.
+    # Add new/missing addresses first. If the address already exists on the
+    # interface, adopt it without issuing a duplicate ip addr add.
     for address in "${desired[@]}"; do
-        if ! is_active "$address"; then
+        if is_active "$address"; then
+            prefix="$(active_prefix "$address")"
+            if [ -n "$prefix" ] && [ "$prefix" != "32" ]; then
+                echo "ERROR: $address is already active on $IFACE with /$prefix, expected /32." >&2
+                echo "Refusing to change its prefix automatically." >&2
+                restore_config "$backup" "$existed"
+                [ -z "$backup" ] || rm -f "$backup"
+                exit 1
+            fi
+        else
             if ip addr add "${address}/32" dev "$IFACE"; then
                 added+=("$address")
             else
