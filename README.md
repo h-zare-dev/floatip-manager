@@ -21,6 +21,22 @@ It is **not** intended for cloud floating-IP products that are implemented only 
 
 Typical target systems are Ubuntu Server 24.04/26.04. Debian also works if the server is already using Netplan; the installer does not install or replace the system's network stack.
 
+## Stable releases
+
+The stable v1.0.1 release is pinned to its own Git tag. For reproducible installs, use the exact tag for both the installer and the downloaded tool:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/h-zare-dev/floatip-manager/v1.0.1/install.sh | sudo env FLOATIP_REF=v1.0.1 bash
+```
+
+Verify the installed version:
+
+```bash
+floatip --version
+```
+
+You can re-run the pinned installer to update an older local copy without removing existing managed Netplan addresses. For the latest unreleased changes, use the `main` installer below.
+
 ## One-line install
 
 ```bash
