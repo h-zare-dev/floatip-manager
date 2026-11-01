@@ -1,79 +1,111 @@
 # floatip-manager
 
-A small Bash utility for managing persistent secondary / floating IPv4 addresses on **Netplan-based Linux servers**.
+**Lightweight, persistent floating IPv4 management for Netplan-based Linux servers.**
 
-It keeps floating IP configuration separate from the server's primary IP configuration, auto-detects the primary IPv4 interface, and provides simple `add`, `del`, `set`, `show`, and `clear` commands.
+`floatip-manager` is a small Bash utility that adds and removes secondary IPv4 addresses on a Linux network interface. It keeps its own Netplan file separate from the server's existing primary-IP/DHCP configuration and avoids a full network reconfiguration during normal address changes.
 
-## Important scope
+> **Important:** This tool manages IPv4 addresses **inside the guest operating system**. Your hosting provider must already route or assign those addresses to your server. It does not create, purchase, move, or attach floating IPs in a provider control panel or API.
 
-This tool is intended for providers/network setups where the floating or secondary public IP must be configured **inside the guest OS** on the server interface (for example, Hetzner Cloud Floating IPs).
+## Features
 
-It is **not** intended for cloud floating-IP products that are implemented only by provider-side NAT/router mapping and do not require the public IP to be bound inside the VM.
+- Add or remove one or multiple floating IPv4 addresses.
+- Replace the managed address list or clear it entirely.
+- Persist managed addresses across reboot and `systemd-networkd` restart.
+- Automatically select the interface used by the IPv4 default route (for example `eth0`, `ens3`, or `enp1s0`).
+- Keep managed floating-IP configuration in a dedicated Netplan file.
+- Adopt an already-active `/32` address into persistent management without issuing a duplicate `ip addr add`.
+- Change only managed `/32` addresses during normal operations; do not run `netplan apply` or `networkctl reload` for every add/delete.
+- No dependency on a port-forwarding manager, Docker, or any cloud-provider API.
 
-## Requirements
+## Compatibility and scope
 
-- Linux
-- Bash
-- `ip` from iproute2
-- Netplan
-- A Netplan/systemd-networkd based network setup
-- root privileges for changes
+| Environment | Support |
+| --- | --- |
+| Ubuntu Server 24.04 / 26.04 using Netplan + `systemd-networkd` | Intended environment |
+| Other Ubuntu releases using the same network stack | May work; verify on the actual host |
+| Debian with Netplan already installed **and used** with `systemd-networkd` | May work; verify first |
+| Debian using `ifupdown`, `/etc/network/interfaces`, or another network manager | Not supported by this installer |
+| Provider-side NAT / router-mapped floating public IPs | Not applicable |
+| IPv6 addresses or non-`/32` IPv4 secondary addresses | Not supported |
 
-Typical target systems are Ubuntu Server 24.04/26.04. Debian also works if the server is already using Netplan; the installer does not install or replace the system's network stack.
+A typical use case is a Hetzner Cloud server with additional public Floating IPv4 addresses routed directly to its VM. Other providers can work if their network configuration requires assigning the public IPv4 inside the VM.
 
-## Stable releases
+**Requirements:** Linux, Bash, `curl` for the installer, `ip` (iproute2), Netplan, an active `systemd-networkd`-based configuration, and root privileges for management commands. The installer checks for `curl`, `bash`, `ip`, and `netplan`; it does **not** install or switch your network stack. It does not automatically prove which backend manages your interface.
 
-The stable v1.0.1 release is pinned to its own Git tag. For reproducible installs, use the exact tag for both the installer and the downloaded tool:
+Before installing on an unfamiliar machine, inspect the network setup:
+
+```bash
+ip -4 route show default
+ls -la /etc/netplan/
+sudo netplan get
+systemctl is-active systemd-networkd
+```
+
+## Installation
+
+### Stable v1.0.1 (recommended)
+
+Download both the installer and the executable from the **same release tag**:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/h-zare-dev/floatip-manager/v1.0.1/install.sh | sudo env FLOATIP_REF=v1.0.1 bash
 ```
 
-Verify the installed version:
+Check the installed version:
 
 ```bash
 floatip --version
 ```
 
-You can re-run the pinned installer to update an older local copy without removing existing managed Netplan addresses. For the latest unreleased changes, use the `main` installer below.
+Expected output:
 
-## One-line install
+```text
+1.0.1
+```
+
+Release notes: [v1.0.1](https://github.com/h-zare-dev/floatip-manager/releases/tag/v1.0.1).
+
+The installer puts the executable at `/usr/local/sbin/floatip`. **Installation alone does not add, remove, or reconfigure any network addresses.** Re-running the installer replaces the executable without deleting your managed Netplan configuration.
+
+> Review remote shell scripts before piping them into `sudo bash`, especially on production servers. Using the release-tag URL avoids unintentionally tracking new commits on `main`.
+
+### Latest main branch (development)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/h-zare-dev/floatip-manager/main/install.sh | sudo bash
 ```
 
-The installer places the command at:
+This installs the latest `main` version, which may differ from the latest tagged release.
 
-```text
-/usr/local/sbin/floatip
-```
+### Install from a cloned repository
 
-It does **not** add or remove any IP addresses during installation.
-
-## Install from a cloned folder
+For a **local installation of the exact checked-out file**, without downloading the executable a second time:
 
 ```bash
 git clone https://github.com/h-zare-dev/floatip-manager.git
 cd floatip-manager
-sudo bash install.sh
-```
-
-Or install the script directly from the cloned repository:
-
-```bash
+git checkout v1.0.1
 sudo install -m 0755 floatip /usr/local/sbin/floatip
 ```
 
-## Usage
+Running `sudo bash install.sh` from a clone is also possible, but that installer downloads the executable from the selected remote ref. Its default is `main`; use `sudo env FLOATIP_REF=v1.0.1 bash install.sh` to select the stable release.
 
-### Show managed floating IPs
+## Quick start
+
+You can use `add` immediately on a fresh installation. **You do not need to run `set` first.**
 
 ```bash
+# Add one or several public IPv4 addresses already assigned/routed by your provider
+sudo floatip add 95.216.178.75 65.109.254.122
+
+# Show persistent managed addresses and their current on-interface status
 sudo floatip show
+
+# Remove just one managed address
+sudo floatip del 95.216.178.75
 ```
 
-Example:
+Example `show` output:
 
 ```text
 Interface: eth0
@@ -82,162 +114,181 @@ Floating IPs:
   65.109.254.122  active
 ```
 
-### Add one or more floating IPs
+`show` reads the address list from `/etc/netplan/60-floating-ip.yaml` and checks those addresses against the detected interface. **It does not list all IP addresses configured on the machine.** An address manually added with `ip addr add` can be active even if `floatip show` says `none`.
 
-No previous `set` command is required. On a fresh server, the first `add` command creates the persistent Netplan file automatically.
+## Commands
+
+| Command | Action |
+| --- | --- |
+| `sudo floatip show` | Show managed addresses and their live status |
+| `sudo floatip add IP [IP ...]` | Add addresses without replacing existing managed addresses |
+| `sudo floatip del IP [IP ...]` | Remove specified managed addresses |
+| `sudo floatip delete IP [IP ...]` | Alias for `del` |
+| `sudo floatip remove IP [IP ...]` | Alias for `del` |
+| `sudo floatip set IP [IP ...]` | Make the managed list exactly match the supplied addresses |
+| `sudo floatip clear` | Remove every address managed by this tool |
+| `floatip --version` | Show installed version |
+
+### Add
 
 ```bash
 sudo floatip add 95.216.178.75
-```
-
-Multiple addresses can be added at once:
-
-```bash
 sudo floatip add 95.216.178.75 65.109.254.122
 ```
 
-If an address is already active on the interface but was added manually, `floatip add` adopts it into the persistent configuration without adding a duplicate address.
+On the first successful add, the managed Netplan file is created automatically. If a requested `/32` address is already active on the selected interface, the tool can adopt it into its configuration rather than trying to add it again. If the address exists with a different prefix, the tool rejects that mismatch rather than changing the prefix automatically.
 
-### Delete one or more floating IPs
+### Delete
 
 ```bash
 sudo floatip del 95.216.178.75
-```
-
-Multiple addresses:
-
-```bash
 sudo floatip del 95.216.178.75 65.109.254.122
 ```
 
-`delete` and `remove` are aliases for `del`.
+Only addresses that are already listed in the tool's managed file can be deleted with `del`. Removing an address that is currently serving traffic can immediately interrupt those connections.
 
-### Replace the complete managed list
+### Replace the managed list
 
 ```bash
 sudo floatip set 95.216.178.75 65.109.254.122
 ```
 
-`set` treats the supplied addresses as the complete desired floating-IP list. Addresses that remain in the list are not removed/re-added unnecessarily.
+`set` replaces the entire **managed** address list. The script adds missing addresses first, then removes previously managed addresses omitted from the new list. Unchanged addresses are not intentionally removed and re-added.
 
-### Remove all managed floating IPs
+### Clear
 
 ```bash
 sudo floatip clear
 ```
 
+This removes all addresses managed by the tool and removes its dedicated Netplan file. It does **not** flush the interface or delete every address on the server.
+
 ## How persistence works
 
-The tool stores only the floating IPs it manages in:
+The tool owns exactly this configuration file:
 
 ```text
 /etc/netplan/60-floating-ip.yaml
 ```
 
-The server's existing primary/DHCP configuration remains in its original Netplan file, such as:
-
-```text
-/etc/netplan/50-cloud-init.yaml
-```
-
-For example, the resulting Netplan configuration may effectively contain:
+For example, after adding two addresses to `eth0`:
 
 ```yaml
 network:
   version: 2
   ethernets:
     eth0:
-      dhcp4: true
       addresses:
         - 95.216.178.75/32
         - 65.109.254.122/32
 ```
 
-The tool runs `netplan generate` to validate and generate persistent backend configuration. Runtime IP changes are applied only to the managed floating addresses, avoiding an unnecessary full `netplan apply` on every add/delete operation.
-
-After a reboot or `systemd-networkd` restart, Netplan/systemd-networkd can restore the configured floating addresses from the persistent file.
-
-## Interface auto-detection
-
-The interface is detected from the IPv4 default route, so names such as these are supported automatically:
+Existing primary address and DHCP settings stay in the provider's existing Netplan configuration, commonly:
 
 ```text
-eth0
-ens3
-ens18
-enp1s0
+/etc/netplan/50-cloud-init.yaml
 ```
 
-For unusual multi-NIC systems, override detection for one command:
+On a conventional Netplan system, matching `eth0` definitions are merged into the effective configuration. For example, the resulting interface can have both `dhcp4: true` and the floating addresses above.
+
+During normal `add` / `del` / `set` operations, the tool:
+
+1. Updates only its managed YAML file.
+2. Runs `netplan generate` to validate the configuration and generate backend files.
+3. Changes the necessary live IPv4 `/32` addresses using `ip addr add` or `ip addr del`.
+
+**It intentionally does not run `netplan apply` or `networkctl reload` on every change.** Reloading the network while the script also changes addresses can race with `ip addr add`, and a full interface reconfiguration can briefly interrupt production connections.
+
+On reboot or a `systemd-networkd` restart, the generated Netplan/networkd configuration should restore managed addresses when this interface is actually managed by `systemd-networkd`. Always verify this behavior on the specific server before relying on it in production.
+
+## Interface detection
+
+By default, the tool uses the interface associated with the IPv4 default route, for example `eth0`, `ens3`, `ens18`, or `enp1s0`. It falls back to a route lookup to `1.1.1.1` if necessary.
+
+For an unusual multi-interface host, choose the interface explicitly:
 
 ```bash
 sudo env FLOATIP_IFACE=ens3 floatip show
 sudo env FLOATIP_IFACE=ens3 floatip add 203.0.113.10
 ```
 
-## Safety behavior
+**Caution:** `floatip-manager` uses a single managed Netplan file and is designed for one selected interface at a time. If the default-route interface changes, or you change `FLOATIP_IFACE` after already managing addresses, review the existing YAML before running another modifying command. The tool does not automatically migrate configuration between network interfaces.
 
-- Does not modify the server's existing primary-IP Netplan file.
-- Refuses invalid IPv4 addresses.
-- Refuses to manage the IPv4 address currently selected as the server's primary/default-route source address.
-- Only removes IPs already managed in `60-floating-ip.yaml`.
-- Adds new addresses before removing obsolete managed addresses when replacing a list.
-- Validates Netplan configuration before changing runtime addresses.
-- Restores the previous managed Netplan file if validation fails.
-- Does not install Netplan on systems that do not already use it.
+## Check and troubleshoot
 
-## Check persistence manually
-
-First inspect the current addresses:
+### Inspect configuration and live addresses
 
 ```bash
-ip -4 addr show
 sudo floatip show
+ip -4 -o addr show
+ip -4 route show default
+sudo netplan get
+sudo cat /etc/netplan/60-floating-ip.yaml
 ```
 
-On a server where a short network interruption is acceptable, you can test a real networkd restart without rebooting:
+The file may not exist on a fresh installation or after `clear`.
+
+If `floatip show` reports `MISSING`, inspect whether the requested IP is actually assigned to the correct interface and check the Netplan/systemd-networkd configuration. Do not assume that the provider has routed the address merely because it appears in the guest.
+
+### Check that persistence survives a networkd restart
+
+Perform this test only during a maintenance window, preferably from your **primary-IP SSH connection with the provider console available**. Restarting the network service can cause a temporary loss of connectivity.
 
 ```bash
+sudo netplan get
 sudo systemctl restart systemd-networkd
 sleep 5
 sudo floatip show
+ip -4 addr show
 ```
 
-The managed addresses should return automatically without running `floatip set` or `floatip add` again.
+Addresses should return without running `floatip set` again. If they do not, collect diagnostics before manually adding them:
 
-## Configuration file
-
-Example generated file:
-
-```yaml
-network:
-  version: 2
-  ethernets:
-    eth0:
-      addresses:
-        - 95.216.178.75/32
-        - 65.109.254.122/32
+```bash
+sudo netplan get
+ip -4 -o addr show
+journalctl -u systemd-networkd --since "-10 min" --no-pager
 ```
 
-Do not mix the primary IP into this file. The primary IP should remain managed by the server/provider's existing network configuration.
+### `Address already assigned`
+
+In older versions, `networkctl reload` could race with a separate `ip addr add` operation, resulting in `Address already assigned`. Version `v1.0.1` removes that automatic reload step and checks whether an address is already active before adding it.
+
+```bash
+floatip --version
+ip -4 -o addr show
+sudo floatip show
+```
+
+If an address is already active with the expected `/32` prefix but not managed by the tool, running `sudo floatip add ADDRESS` with `v1.0.1` can register it persistently without a duplicate add. If the failure persists, inspect the runtime addresses and generated configuration instead of deleting the primary IP or flushing the interface.
+
+### Important limitations
+
+- The tool does not change your provider's IP allocation, routing, firewall rules, or NAT configuration.
+- It does not integrate with or require `iptables-forward-manager`, Docker, or another application.
+- `add` and `set` refuse the IPv4 currently selected as the default-route source address. This is not a complete safeguard against future changes in which the primary address is reassigned; inspect the managed file before `del` / `clear` on a server whose addressing has changed.
+- The tool validates the Netplan configuration, but it does not perform a complete end-to-end reachability test.
+- It assumes this managed Netplan file is owned by `floatip-manager`; do not hand-edit it into a different schema while continuing to use the commands.
 
 ## Uninstall
 
-Remove only the command:
+To remove **only the command**, keeping current IP configuration intact:
 
 ```bash
 sudo rm -f /usr/local/sbin/floatip
 ```
 
-This intentionally leaves `/etc/netplan/60-floating-ip.yaml` untouched so uninstalling the command does not unexpectedly remove live network addresses.
+This intentionally leaves `/etc/netplan/60-floating-ip.yaml` in place.
 
-If you want to remove the managed floating IPs first:
+To remove all **managed IPs first** and then uninstall:
 
 ```bash
 sudo floatip clear
 sudo rm -f /usr/local/sbin/floatip
 ```
 
-## Notes
+**Warning:** `clear` removes addresses immediately and can disconnect active users or SSH sessions using those addresses.
 
-Changing network configuration always carries some risk on remote servers. Keep your provider console available when testing networking changes, especially on multi-interface or customized network setups.
+## License
+
+[MIT](LICENSE)
